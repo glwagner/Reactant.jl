@@ -450,7 +450,9 @@ function compile_mlir!(
         @NamedTuple{
             f_name::String,
             mlir_result_types::Vector{MLIR.IR.Type},
+            linear_args::Vector{TracedType},
             traced_result::Any,
+            linear_results::Vector{TracedType},
             mutated::Vector{Int},
         }
     }();
@@ -607,6 +609,7 @@ function compile_mlir!(
             push!(linear_results2, linear_results[i])
             continue
         end
+        @warn("Preserving argument $(i) $op")
         push!(preserved_args, (linear_results[i], MLIR.IR.block_arg_num(op)))
     end
     fnbody = MLIR.IR.block(ret)
@@ -833,28 +836,49 @@ function codegen_unflatten!(
     concrete_result,
     result_stores,
 )
+    println("➡️ Starting codegen_unflatten!")
+    println("📍 Input parameters:")
+    println("   Linear args: ", collect(Any, linear_args))
+    println("   Preserved args: ", collect(Any, preserved_args))
+    println("   Concretized result names: ", concretized_res_names)
+    println("   Linear results: ", collect(Any, linear_results))
+    println("   Concrete result: ", concrete_result)
+    println("   Initial result stores: ", result_stores)
+
     cache_dict = gensym("cache_dict")
+    println("🔄 Created cache_dict symbol: ", cache_dict)
     unflatten_code = Expr[:(
         $cache_dict = $(IdDict{
             Union{TracedRArray,TracedRNumber},Union{ConcreteRArray,ConcreteRNumber}
         }())
     ),]
 
-    # mutate the result stores to point to the correct concrete results
-    for (concrete_res_name, result) in zip(concretized_res_names, linear_results)
+    # Process linear results
+    println("\n🔍 Processing linear results...")
+    for (i, (concrete_res_name, result)) in enumerate(zip(concretized_res_names, linear_results))
+        println("\n   Processing result #$i:")
+        println("   Concrete result name: ", concrete_res_name)
+        println("   Result: ", result)
+
         paths = (
             (
                 p for p in Reactant.TracedUtils.get_paths(result) if
                 length(p) > 0 && (p[1] == :result || p[1] == :resargs)
             )...,
         )
+        println("   Found paths: ", paths)
+
         for path in paths
+            println("\n   Processing path: ", path)
             if path[1] == :result
+                println("   ⚡ Result path detected")
                 unflatcode = :result
                 path = path[2:end]
                 result_stores[path] = concrete_res_name
+                println("   Updated result_stores: ", result_stores)
                 continue
             else
+                println("   ⚡ Resargs path detected")
                 @assert path[1] == :resargs
                 unflatcode = :(args[$(path[2])])
                 path = path[3:end]
@@ -906,12 +930,20 @@ function codegen_unflatten!(
     end
 
     prevkeys = collect(keys(result_stores))
+    println("\n📊 Previous result store keys: ", prevkeys)
     result_code = create_result(concrete_result, (), result_stores)
+    println("🎯 Generated result code: ", result_code)
     postkeys = collect(keys(result_stores))
+    println("📊 Post result store keys: ", postkeys)
     used = [t for t in prevkeys if !in(t, postkeys)]
+    println("🔍 Used keys: ", used)
 
     # if some argument is mutated, change them to point to the correct concrete results
-    for (result, arg_idx) in preserved_args
+    println("\n🔄 Processing preserved args...")
+    for (i, (result, arg_idx)) in enumerate(preserved_args)
+        println("\n   Processing preserved arg #$i:")
+        println("   Result: ", result)
+        println("   Arg index: ", arg_idx)
         paths = (
             (
                 p for p in Reactant.TracedUtils.get_paths(result) if
@@ -958,6 +990,7 @@ function codegen_unflatten!(
     # generate return object which stores the concrete results in some arbitrary way
     pushfirst!(unflatten_code, :(result = $result_code))
     # push!(unflatten_code, :(return result))
+    println("\n✅ Final unflatten code length: ", length(unflatten_code))
 
     return unflatten_code
 end
@@ -1025,6 +1058,7 @@ function compile_xla(f, args; client=nothing, optimize=true, no_nan=false, devic
         linear_args, linear_results, preserved_args, seen_args, concrete_result, isclosure = compile_mlir!(
             mod, f, args; optimize, no_nan, backend
         )
+        @warn "linear results after compile_mlir!: $linear_results"
 
         # Resolve client and device
         if device === nothing
@@ -1080,6 +1114,7 @@ function compile(f, args; sync=false, kwargs...)
     exec, linear_args, linear_results, preserved_args, seen_args, concrete_result, isclosure = compile_xla(
         f, args; kwargs...
     )
+    @warn "linear results after compile-xla: $linear_results"
 
     preserved_args_idx = last.(preserved_args)
     donated_args_mask = map(1:length(linear_args)) do i
@@ -1126,6 +1161,10 @@ function compile(f, args; sync=false, kwargs...)
         $(unflatten_code...)
         return result
     end
+    @warn "compiling $f"
+    display(body)
+    println("##############################################")
+
 
     return register_thunk(fname, Tuple{map(Core.Typeof, args)...}, body, f, isclosure)
 end

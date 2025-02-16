@@ -2101,6 +2101,7 @@ end
         # make tracer inserted `()` into the path, here we remove it:
         v.paths = v.paths[1:(end - 1)]
     end
+    @warn "linear args: $linear_args"
 
     seen = Dict()
     cache_key = []
@@ -2108,17 +2109,23 @@ end
     cache = Reactant.Compiler.callcache()
     if haskey(cache, cache_key)
         # cache lookup:
-        (; f_name, mlir_result_types, traced_result, mutated) = cache[cache_key]
+        (; f_name, mlir_result_types, linear_args, traced_result, linear_results, mutated) = cache[cache_key]
     else
         f_name = String(gensym(Symbol(f)))
         temp = Reactant.TracedUtils.make_mlir_fn(
-            f, args, (), f_name, false; args_in_result=:mutated, do_transpose=false
+            f, args, (), f_name, false; args_in_result=:all, do_transpose=false
         )
-        traced_result, ret, mutated = temp[[3, 6, 10]]
+        traced_result, ret, linear_args, linear_results, mutated = temp[[3, 6, 7, 9, 10]]
         mlir_result_types = [
             MLIR.IR.type(MLIR.IR.operand(ret, i)) for i in 1:MLIR.IR.noperands(ret)
         ]
-        cache[cache_key] = (; f_name, mlir_result_types, traced_result, mutated)
+        cache[cache_key] = (; f_name, mlir_result_types, linear_args, traced_result, linear_results, mutated)
+    end
+    @warn "traced result: $traced_result"
+
+    original_paths = []
+    for arg in linear_args
+        push!(original_paths, arg.paths)
     end
 
     call_op = MLIR.Dialects.func.call(
@@ -2127,30 +2134,46 @@ end
         callee=MLIR.IR.FlatSymbolRefAttribute(f_name),
     )
 
-    seen_results = Reactant.OrderedIdDict()
-    traced_result = Reactant.make_tracer(
-        seen_results,
-        traced_result,
-        (), # we have to insert something here, but we remove it immediately below.
-        Reactant.TracedSetPath;
-        toscalar=false,
-    )
+    # seen_results = Reactant.OrderedIdDict()
+    # traced_result = Reactant.make_tracer(
+    #     seen_results,
+    #     traced_result,
+    #     (), # we have to insert something here, but we remove it immediately below.
+    #     Reactant.TracedSetPath;
+    #     toscalar=false,
+    # )
     i = 1
-    for (k, v) in seen_results
+    for v in linear_results
         v isa Reactant.TracedType || continue
         # this mutates `traced_result`, which is what we want:
         v.mlir_data = MLIR.IR.result(call_op, i)
         # make tracer inserted `()` into the path, here we remove it:
-        v.paths = v.paths[1:(end - 1)]
+        # v.paths = v.paths[1:(end - 1)]
+        @warn "looking through paths: $(v.paths)"
+        for p in v.paths
+            if length(p) > 0 && p[1] == :resargs
+                arg_i = p[2]
+                @warn "Changing arg $arg_i to call result $i"
+                Reactant.TracedUtils.set_mlir_data!(
+                    linear_args[arg_i], MLIR.IR.result(call_op, i)
+                )
+            end
+        end
+        # reset paths before returning to `make_mlir_fn` from the caller.
+        Reactant.TracedUtils.set_paths!(v, ())
         i += 1
+    end
+    for (arg, og_path) in zip(linear_args, original_paths)
+        # restore argument paths before returning to make_mlir_fn.
+        Reactant.TracedUtils.set_paths!(arg, og_path)
     end
     nres = MLIR.IR.nresults(call_op)
     # mutated args are included as the last ones in the call op results
-    for (result_i, arg_i) in zip((nres - length(mutated)):nres, mutated)
-        Reactant.TracedUtils.set_mlir_data!(
-            linear_args[arg_i], MLIR.IR.result(call_op, result_i + 1)
-        )
-    end
+    # for (result_i, arg_i) in zip((nres - length(mutated)):nres, mutated)
+    #     Reactant.TracedUtils.set_mlir_data!(
+    #         linear_args[arg_i], MLIR.IR.result(call_op, result_i + 1)
+    #     )
+    # end
     return traced_result
 end
 

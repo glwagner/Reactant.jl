@@ -210,7 +210,7 @@ function prepare_results(
         seen_results,
         result,
         (:result,),
-        concretein ? Reactant.TracedTrack : Reactant.TracedSetPath,
+        true ? Reactant.TracedTrack : Reactant.TracedSetPath,
     )
 
     # marks buffers to be donated
@@ -218,7 +218,7 @@ function prepare_results(
         Reactant.make_tracer(
             seen_results,
             traced_args[i],
-            concretein ? (:resargs, i) : (),
+            true ? (:resargs, i) : (),
             Reactant.TracedTrack,
         )
     end
@@ -229,7 +229,9 @@ function prepare_results(
         (args_in_result != :all && has_argidx(v)) && continue
         push!(linear_results, v)
     end
+    @warn "linear results in prepare results with args_in_result: $args_in_result\n$(linear_results)"
     if args_in_result == :mutated
+        Core.println("appending $(length(mutated_args)) mutated arguments ($mutated_args) for:\n$fnbody")
         append!(linear_results, linear_args[mutated_args])
     end
 
@@ -366,6 +368,8 @@ function make_mlir_fn(
 
     name = __lookup_unique_name_in_module(mod, name)
     final_func = final_func!(temp_func, mod, name, in_tys, out_tys, sym_visibility)
+
+    @warn "linear results at the end of make_mlir_fn: $linear_results"
 
     return (
         false,
